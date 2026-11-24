@@ -1,5 +1,72 @@
-import React, { useState } from 'react';
-import { Mic, Play, Upload, Activity, Home as HomeIcon, BookOpen, Users, BarChart, ClipboardList } from 'lucide-react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Mic, Play, Upload, Activity, Home as HomeIcon, BookOpen, Users } from 'lucide-react';
+
+// --- PURE JS RADIX-2 COOLEY-TUKEY FFT (For Offline Spectrogram) ---
+function computeFFT(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) {
+      j ^= bit;
+    }
+    j ^= bit;
+    if (i < j) {
+      [re[i], re[j]] = [re[j], re[i]];
+      [im[i], im[j]] = [im[j], im[i]];
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const halfLen = len >> 1;
+    const angle = (-2 * Math.PI) / len;
+    const wRe = Math.cos(angle);
+    const wIm = Math.sin(angle);
+    for (let i = 0; i < n; i += len) {
+      let curRe = 1;
+      let curIm = 0;
+      for (let j = 0; j < halfLen; j++) {
+        const uRe = re[i + j];
+        const uIm = im[i + j];
+        const vRe = re[i + j + halfLen] * curRe - im[i + j + halfLen] * curIm;
+        const vIm = re[i + j + halfLen] * curIm + im[i + j + halfLen] * curRe;
+        re[i + j] = uRe + vRe;
+        im[i + j] = uIm + vIm;
+        re[i + j + halfLen] = uRe - vRe;
+        im[i + j + halfLen] = uIm - vIm;
+        const nextRe = curRe * wRe - curIm * wIm;
+        curIm = curRe * wIm + curIm * wRe;
+        curRe = nextRe;
+      }
+    }
+  }
+}
+
+// Color map for spectrograms (0..1 -> RGB Inferno-style)
+function magnitudeToRGB(norm) {
+  const v = Math.max(0, Math.min(1, norm));
+  let r, g, b;
+  if (v < 0.25) {
+    const t = v / 0.25;
+    r = Math.floor(15 + t * 75);
+    g = Math.floor(10 + t * 15);
+    b = Math.floor(35 + t * 95);
+  } else if (v < 0.5) {
+    const t = (v - 0.25) / 0.25;
+    r = Math.floor(90 + t * 110);
+    g = Math.floor(25 + t * 35);
+    b = Math.floor(130 - t * 30);
+  } else if (v < 0.75) {
+    const t = (v - 0.5) / 0.25;
+    r = Math.floor(200 + t * 50);
+    g = Math.floor(60 + t * 110);
+    b = Math.floor(100 - t * 80);
+  } else {
+    const t = (v - 0.75) / 0.25;
+    r = 255;
+    g = Math.floor(170 + t * 85);
+    b = Math.floor(20 + t * 180);
+  }
+  return [r, g, b];
+}
 
 // Helper function to export Web Audio API buffer to a downloadable WAV file
 function audioBufferToWav(buffer) {
@@ -56,19 +123,33 @@ function audioBufferToWav(buffer) {
 }
 
 const App = () => {
-  const [activeTab, setActiveTab] = useState('progress');
-  
-  // Offline Vocoder State
+  const [activeTab, setActiveTab] = useState('overview');
+
+  // --- OFFLINE VOCODER STATE & REFS ---
   const [modulatorFile, setModulatorFile] = useState(null);
   const [carrierFile, setCarrierFile] = useState(null);
   const [offlineOutputUrl, setOfflineOutputUrl] = useState(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [hasSpectrogram, setHasSpectrogram] = useState(false);
+
+  const offlineAudioRef = useRef(null);
+  const offlineCanvasRef = useRef(null);
+  const offlineSpecImageRef = useRef(null);
+  const offlineAnimRef = useRef(null);
+
+  // --- LIVE VOCODER STATE & REFS ---
+  const [liveCarrierType, setLiveCarrierType] = useState('sawtooth');
+  const [isLiveRunning, setIsLiveRunning] = useState(false);
+  const liveCtxRef = useRef(null);
+  const liveStreamRef = useRef(null);
+  const liveAnalyserRef = useRef(null);
+  const liveCanvasRef = useRef(null);
+  const liveAnimRef = useRef(null);
 
   const umichBlue = '#00274C';
   const umichMaize = '#FFCB05';
 
   const navItems = [
-    { id: 'progress', label: 'Progress Report', icon: <ClipboardList size={18} /> },
     { id: 'overview', label: 'Overview', icon: <HomeIcon size={18} /> },
     { id: 'methods', label: 'Methods', icon: <BookOpen size={18} /> },
     { id: 'live', label: 'Live Vocoder', icon: <Mic size={18} /> },
@@ -76,17 +157,124 @@ const App = () => {
     { id: 'contributions', label: 'Contributions', icon: <Users size={18} /> }
   ];
 
+  // --- OFFLINE SPECTROGRAM RENDERING & PLAYHEAD ---
+  const buildOfflineSpectrogram = (audioBuffer) => {
+    const channelData = audioBuffer.getChannelData(0);
+    const sampleRate = audioBuffer.sampleRate;
+    const fftSize = 1024;
+    const maxFreq = 8000;
+    const maxBin = Math.min(fftSize / 2, Math.floor((maxFreq / sampleRate) * fftSize));
+
+    const numFrames = Math.min(700, Math.max(100, Math.floor((channelData.length - fftSize) / 256)));
+    const hopSize = Math.max(1, Math.floor((channelData.length - fftSize) / numFrames));
+
+    const hann = new Float32Array(fftSize);
+    for (let i = 0; i < fftSize; i++) {
+      hann[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (fftSize - 1)));
+    }
+
+    const offscreen = document.createElement('canvas');
+    offscreen.width = numFrames;
+    offscreen.height = maxBin;
+    const offCtx = offscreen.getContext('2d');
+    const imgData = offCtx.createImageData(numFrames, maxBin);
+
+    const re = new Float32Array(fftSize);
+    const im = new Float32Array(fftSize);
+
+    for (let frame = 0; frame < numFrames; frame++) {
+      const start = frame * hopSize;
+      for (let i = 0; i < fftSize; i++) {
+        re[i] = (channelData[start + i] || 0) * hann[i];
+        im[i] = 0;
+      }
+      computeFFT(re, im);
+
+      for (let bin = 0; bin < maxBin; bin++) {
+        const mag = Math.sqrt(re[bin] * re[bin] + im[bin] * im[bin]) / (fftSize / 2);
+        const db = 20 * Math.log10(mag + 1e-6);
+        const norm = (db + 80) / 70;
+        const [r, g, b] = magnitudeToRGB(norm);
+
+        const y = maxBin - 1 - bin;
+        const idx = (y * numFrames + frame) * 4;
+        imgData.data[idx] = r;
+        imgData.data[idx + 1] = g;
+        imgData.data[idx + 2] = b;
+        imgData.data[idx + 3] = 255;
+      }
+    }
+
+    offCtx.putImageData(imgData, 0, 0);
+    offlineSpecImageRef.current = offscreen;
+    setHasSpectrogram(true);
+  };
+
+  const drawOfflineFrame = useCallback(() => {
+    const canvas = offlineCanvasRef.current;
+    const specImg = offlineSpecImageRef.current;
+    const audio = offlineAudioRef.current;
+    if (!canvas || !specImg) return;
+
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width;
+    const h = canvas.height;
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(specImg, 0, 0, w, h);
+
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.75)';
+    ctx.font = '11px monospace';
+    ctx.fillText('8 kHz', 6, 14);
+    ctx.fillText('4 kHz', 6, h / 2 + 4);
+    ctx.fillText('0 Hz', 6, h - 6);
+
+    if (audio && audio.duration > 0) {
+      const progress = audio.currentTime / audio.duration;
+      const x = Math.max(0, Math.min(w, progress * w));
+
+      ctx.strokeStyle = '#FFCB05';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'offline' && hasSpectrogram) {
+      drawOfflineFrame();
+    }
+  }, [activeTab, hasSpectrogram, drawOfflineFrame]);
+
+  const startOfflinePlayheadLoop = () => {
+    cancelAnimationFrame(offlineAnimRef.current);
+    const loop = () => {
+      drawOfflineFrame();
+      if (offlineAudioRef.current && !offlineAudioRef.current.paused) {
+        offlineAnimRef.current = requestAnimationFrame(loop);
+      }
+    };
+    offlineAnimRef.current = requestAnimationFrame(loop);
+  };
+
+  const stopOfflinePlayheadLoop = () => {
+    cancelAnimationFrame(offlineAnimRef.current);
+    drawOfflineFrame();
+  };
+
   // --- OFFLINE VOCODER DSP IMPLEMENTATION ---
   const processOfflineVocoder = async () => {
     if (!modulatorFile || !carrierFile) {
       alert("Please upload both a modulator (speech) and carrier (synth) file first.");
       return;
     }
-    
+
     setIsProcessing(true);
     try {
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      
+
       const modArrayBuffer = await modulatorFile.arrayBuffer();
       const carArrayBuffer = await carrierFile.arrayBuffer();
       const modBuffer = await audioCtx.decodeAudioData(modArrayBuffer);
@@ -94,24 +282,25 @@ const App = () => {
 
       const duration = Math.min(modBuffer.duration, carBuffer.duration);
       const sampleRate = modBuffer.sampleRate;
-      const offlineCtx = new OfflineAudioContext(1, sampleRate * duration, sampleRate);
+      const totalSamples = Math.floor(sampleRate * duration);
+      const offlineCtx = new OfflineAudioContext(1, totalSamples, sampleRate);
 
-      // Rectification Curve (Absolute Value)
       const curveLength = 4096;
       const rectCurve = new Float32Array(curveLength);
-      // Expander Curve (x^2 function)
       const expanderCurve = new Float32Array(curveLength);
-      
+      const satCurve = new Float32Array(curveLength);
+
       for (let i = 0; i < curveLength; i++) {
         const x = (i * 2) / (curveLength - 1) - 1;
         rectCurve[i] = Math.abs(x);
-        expanderCurve[i] = x > 0 ? (x * x) : 0; 
+        expanderCurve[i] = x > 0 ? Math.pow(x, 1.6) : 0;
+        satCurve[i] = Math.tanh(x * 4.0);
       }
 
-      const numBands = 24; 
+      const numBands = 24;
       const fMin = 100;
       const fMax = Math.min(8000, sampleRate / 2 - 100);
-      const qValue = 6.0; 
+      const qValue = 6.0;
 
       const modSource = offlineCtx.createBufferSource();
       modSource.buffer = modBuffer;
@@ -119,10 +308,52 @@ const App = () => {
       const carSource = offlineCtx.createBufferSource();
       carSource.buffer = carBuffer;
 
-      // Clean speech pre-emphasis
+      // 1. MODULATOR PRE-EMPHASIS
       const preEmphasis = offlineCtx.createIIRFilter([1, -0.95], [1, 0]);
       modSource.connect(preEmphasis);
 
+      // 2. UNIVERSAL CARRIER CONDITIONING
+      const carCompressor = offlineCtx.createDynamicsCompressor();
+      carCompressor.threshold.value = -45;
+      carCompressor.knee.value = 10;
+      carCompressor.ratio.value = 20;
+      carCompressor.attack.value = 0.002;
+      carCompressor.release.value = 0.08;
+
+      const carMakeup = offlineCtx.createGain();
+      carMakeup.gain.value = 12.0;
+
+      const carSaturator = offlineCtx.createWaveShaper();
+      carSaturator.curve = satCurve;
+
+      const noiseBuffer = offlineCtx.createBuffer(1, totalSamples, sampleRate);
+      const noiseData = noiseBuffer.getChannelData(0);
+      for (let i = 0; i < totalSamples; i++) {
+        noiseData[i] = Math.random() * 2 - 1;
+      }
+      const noiseSource = offlineCtx.createBufferSource();
+      noiseSource.buffer = noiseBuffer;
+
+      const noiseHPF = offlineCtx.createBiquadFilter();
+      noiseHPF.type = 'highpass';
+      noiseHPF.frequency.value = 2000;
+
+      const noiseGain = offlineCtx.createGain();
+      noiseGain.gain.value = 0.08;
+
+      const conditionedCarrier = offlineCtx.createGain();
+      conditionedCarrier.gain.value = 1.0;
+
+      carSource.connect(carCompressor);
+      carCompressor.connect(carMakeup);
+      carMakeup.connect(carSaturator);
+      carSaturator.connect(conditionedCarrier);
+
+      noiseSource.connect(noiseHPF);
+      noiseHPF.connect(noiseGain);
+      noiseGain.connect(conditionedCarrier);
+
+      // 3. 24-BAND FILTER BANK
       const mainMix = offlineCtx.createGain();
       mainMix.gain.value = 1.0;
 
@@ -133,9 +364,9 @@ const App = () => {
 
       for (let i = 0; i < numBands; i++) {
         const lowFreq = filterBounds[i];
-        const highFreq = filterBounds[i+1];
+        const highFreq = filterBounds[i + 1];
         const centerFreq = Math.sqrt(lowFreq * highFreq);
-        
+
         let weight = 1.0 + 1.5 * (1.0 / (1.0 + (centerFreq / 800.0)));
         weight = Math.max(0.8, Math.min(weight, 3.0));
 
@@ -144,28 +375,28 @@ const App = () => {
         modFilter1.type = 'bandpass';
         modFilter1.frequency.value = centerFreq;
         modFilter1.Q.value = qValue;
-        
+
         const modFilter2 = offlineCtx.createBiquadFilter();
         modFilter2.type = 'bandpass';
         modFilter2.frequency.value = centerFreq;
         modFilter2.Q.value = qValue;
 
         const rectifier = offlineCtx.createWaveShaper();
-        rectifier.curve = rectCurve; 
+        rectifier.curve = rectCurve;
 
         const lpf1 = offlineCtx.createBiquadFilter();
         lpf1.type = 'lowpass';
-        lpf1.frequency.value = 30; 
-        
+        lpf1.frequency.value = 30;
+
         const lpf2 = offlineCtx.createBiquadFilter();
         lpf2.type = 'lowpass';
-        lpf2.frequency.value = 30; 
+        lpf2.frequency.value = 30;
 
         const expander = offlineCtx.createWaveShaper();
         expander.curve = expanderCurve;
 
         const envBoost = offlineCtx.createGain();
-        envBoost.gain.value = weight * 50.0; 
+        envBoost.gain.value = weight * 40.0;
 
         preEmphasis.connect(modFilter1);
         modFilter1.connect(modFilter2);
@@ -185,21 +416,17 @@ const App = () => {
         carFilter2.type = 'bandpass';
         carFilter2.frequency.value = centerFreq;
         carFilter2.Q.value = qValue;
-        
-        const carDrive = offlineCtx.createGain();
-        carDrive.gain.value = 12.0;
 
         const vca = offlineCtx.createGain();
-        vca.gain.value = 0; 
+        vca.gain.value = 0;
 
-        carSource.connect(carDrive);
-        carDrive.connect(carFilter1);
+        conditionedCarrier.connect(carFilter1);
         carFilter1.connect(carFilter2);
         carFilter2.connect(vca);
 
         // -- MODULATION --
         envBoost.connect(vca.gain);
-        
+
         if (i % 2 === 1) {
           const inverter = offlineCtx.createGain();
           inverter.gain.value = -1;
@@ -210,14 +437,14 @@ const App = () => {
         }
       }
 
-      // --- MASTER OUTPUT ---
+      // 4. MASTER OUTPUT
       const masterOut = offlineCtx.createDynamicsCompressor();
       masterOut.threshold.value = -12;
       masterOut.ratio.value = 12;
       masterOut.attack.value = 0.005;
 
       const finalMakeupGain = offlineCtx.createGain();
-      finalMakeupGain.gain.value = 40.0; 
+      finalMakeupGain.gain.value = 25.0;
 
       mainMix.connect(masterOut);
       masterOut.connect(finalMakeupGain);
@@ -225,16 +452,249 @@ const App = () => {
 
       modSource.start(0);
       carSource.start(0);
+      noiseSource.start(0);
 
       const renderedBuffer = await offlineCtx.startRendering();
       const wavBlob = audioBufferToWav(renderedBuffer);
       setOfflineOutputUrl(URL.createObjectURL(wavBlob));
+
+      buildOfflineSpectrogram(renderedBuffer);
 
     } catch (error) {
       console.error("Error processing offline vocoder:", error);
       alert("Error processing audio. Please ensure valid audio files are uploaded.");
     }
     setIsProcessing(false);
+  };
+
+  // --- LIVE REAL-TIME VOCODER IMPLEMENTATION ---
+  const stopLiveVocoder = useCallback(() => {
+    cancelAnimationFrame(liveAnimRef.current);
+    if (liveStreamRef.current) {
+      liveStreamRef.current.getTracks().forEach(track => track.stop());
+      liveStreamRef.current = null;
+    }
+    if (liveCtxRef.current) {
+      liveCtxRef.current.close();
+      liveCtxRef.current = null;
+    }
+    liveAnalyserRef.current = null;
+    setIsLiveRunning(false);
+  }, []);
+
+  useEffect(() => {
+    if (activeTab !== 'live' && isLiveRunning) {
+      stopLiveVocoder();
+    }
+  }, [activeTab, isLiveRunning, stopLiveVocoder]);
+
+  const startLiveVocoder = async () => {
+    if (isLiveRunning) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: true, // Helps eliminate laptop fan & room hiss
+          autoGainControl: false
+        }
+      });
+      liveStreamRef.current = stream;
+
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      liveCtxRef.current = audioCtx;
+
+      const micSource = audioCtx.createMediaStreamSource(stream);
+
+      // Pre-emphasis on live mic
+      const preEmphasis = audioCtx.createIIRFilter([1, -0.95], [1, 0]);
+      micSource.connect(preEmphasis);
+
+      // Carrier generator bus & formant shift multiplier
+      const carrierBus = audioCtx.createGain();
+      carrierBus.gain.value = 0.6;
+      let formantShift = 1.0;
+
+      const addOsc = (type, freq, gainVal = 1.0) => {
+        const osc = audioCtx.createOscillator();
+        osc.type = type;
+        osc.frequency.value = freq;
+        const g = audioCtx.createGain();
+        g.gain.value = gainVal;
+        osc.connect(g);
+        g.connect(carrierBus);
+        osc.start();
+      };
+
+      if (liveCarrierType === 'sawtooth') {
+        addOsc('sawtooth', 110, 0.6);    // A2
+        addOsc('sawtooth', 164.81, 0.5); // E3
+      } else if (liveCarrierType === 'chord') {
+        // Rich 4-note A Major synth chord (Daft Punk style)
+        addOsc('sawtooth', 110, 0.35);    // A2
+        addOsc('sawtooth', 164.81, 0.35); // E3
+        addOsc('sawtooth', 220, 0.3);     // A3
+        addOsc('sawtooth', 277.18, 0.3);  // C#4
+      } else if (liveCarrierType === 'chipmunk') {
+        // High-pitched bright carrier + 1.55x upward formant shift
+        formantShift = 1.55;
+        addOsc('sawtooth', 392.0, 0.6);  // G4
+        addOsc('sawtooth', 587.33, 0.4); // D5
+      } else if (liveCarrierType === 'monster') {
+        // Sub-bass carrier + 0.65x downward formant shift
+        formantShift = 0.65;
+        addOsc('sawtooth', 65.41, 0.6);  // C2
+        addOsc('square', 66.0, 0.4);     // Detuned sub-square
+      } else if (liveCarrierType === 'noise') {
+        const bufSize = audioCtx.sampleRate * 2;
+        const noiseBuf = audioCtx.createBuffer(1, bufSize, audioCtx.sampleRate);
+        const data = noiseBuf.getChannelData(0);
+        for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+        const noiseSrc = audioCtx.createBufferSource();
+        noiseSrc.buffer = noiseBuf;
+        noiseSrc.loop = true;
+        noiseSrc.connect(carrierBus);
+        noiseSrc.start();
+      } else {
+        // Robot Drone
+        addOsc('square', 82.41, 0.55);   // E2
+        addOsc('sawtooth', 83.2, 0.55);  // Detuned saw
+      }
+
+      // Rectification curve + Linear Noise-Gate curve
+      const curveLength = 2048;
+      const rectCurve = new Float32Array(curveLength);
+      const gateCurve = new Float32Array(curveLength);
+      const gateThreshold = 0.0007; // Mutes idle hiss without crushing normal speech
+
+      for (let i = 0; i < curveLength; i++) {
+        const x = (i * 2) / (curveLength - 1) - 1;
+        rectCurve[i] = Math.abs(x);
+        if (x <= gateThreshold) {
+          gateCurve[i] = 0;
+        } else {
+          // Linear pass-through above threshold (no squaring)
+          gateCurve[i] = x - gateThreshold;
+        }
+      }
+
+      // Real-time 20-band filter bank
+      const numBands = 20;
+      const fMin = 120;
+      const fMax = 7500;
+      const qValue = 5.5;
+      const mainMix = audioCtx.createGain();
+      mainMix.gain.value = 1.0;
+
+      const bounds = [];
+      for (let i = 0; i <= numBands; i++) {
+        bounds.push(fMin * Math.pow(fMax / fMin, i / numBands));
+      }
+
+      const maxSafeFreq = audioCtx.sampleRate / 2 - 200;
+
+      for (let i = 0; i < numBands; i++) {
+        const centerFreq = Math.sqrt(bounds[i] * bounds[i + 1]);
+        const shiftedCarFreq = Math.max(60, Math.min(maxSafeFreq, centerFreq * formantShift));
+
+        // Modulator band
+        const modFilter = audioCtx.createBiquadFilter();
+        modFilter.type = 'bandpass';
+        modFilter.frequency.value = centerFreq;
+        modFilter.Q.value = qValue;
+
+        const rectifier = audioCtx.createWaveShaper();
+        rectifier.curve = rectCurve;
+
+        const lpf = audioCtx.createBiquadFilter();
+        lpf.type = 'lowpass';
+        lpf.frequency.value = 35;
+
+        // Noise gate + quadratic expansion per band
+        const gate = audioCtx.createWaveShaper();
+        gate.curve = gateCurve;
+
+        const envGain = audioCtx.createGain();
+        envGain.gain.value = 30.0; // Compensates for quadratic gate attenuation
+
+        preEmphasis.connect(modFilter);
+        modFilter.connect(rectifier);
+        rectifier.connect(lpf);
+        lpf.connect(gate);
+        gate.connect(envGain);
+
+        // Carrier band (with optional formant shift for Chipmunk / Monster)
+        const carFilter = audioCtx.createBiquadFilter();
+        carFilter.type = 'bandpass';
+        carFilter.frequency.value = shiftedCarFreq;
+        carFilter.Q.value = qValue;
+
+        const vca = audioCtx.createGain();
+        vca.gain.value = 0;
+
+        carrierBus.connect(carFilter);
+        carFilter.connect(vca);
+        envGain.connect(vca.gain);
+
+        if (i % 2 === 1) {
+          const inv = audioCtx.createGain();
+          inv.gain.value = -1;
+          vca.connect(inv);
+          inv.connect(mainMix);
+        } else {
+          vca.connect(mainMix);
+        }
+      }
+
+      // Master compressor + Analyser for live scrolling spectrogram
+      const compressor = audioCtx.createDynamicsCompressor();
+      compressor.threshold.value = -12;
+      compressor.ratio.value = 10;
+
+      const outGain = audioCtx.createGain();
+      outGain.gain.value = 3.0;
+
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.2;
+      liveAnalyserRef.current = analyser;
+
+      mainMix.connect(compressor);
+      compressor.connect(outGain);
+      outGain.connect(analyser);
+      analyser.connect(audioCtx.destination);
+
+      setIsLiveRunning(true);
+
+      // Start scrolling spectrogram draw loop
+      const freqData = new Uint8Array(analyser.frequencyBinCount);
+      const drawLiveSpectrogram = () => {
+        const canvas = liveCanvasRef.current;
+        if (!canvas || !liveAnalyserRef.current) return;
+        const ctx = canvas.getContext('2d');
+        const w = canvas.width;
+        const h = canvas.height;
+
+        liveAnalyserRef.current.getByteFrequencyData(freqData);
+
+        ctx.drawImage(canvas, 2, 0, w - 2, h, 0, 0, w - 2, h);
+
+        const maxBin = Math.min(freqData.length, Math.floor((8000 / (audioCtx.sampleRate / 2)) * freqData.length));
+        for (let y = 0; y < h; y++) {
+          const bin = Math.floor(((h - 1 - y) / h) * maxBin);
+          const norm = freqData[bin] / 255;
+          const [r, g, b] = magnitudeToRGB(norm);
+          ctx.fillStyle = `rgb(${r},${g},${b})`;
+          ctx.fillRect(w - 2, y, 2, 1);
+        }
+
+        liveAnimRef.current = requestAnimationFrame(drawLiveSpectrogram);
+      };
+      liveAnimRef.current = requestAnimationFrame(drawLiveSpectrogram);
+
+    } catch (err) {
+      console.error("Microphone error:", err);
+      alert("Could not access microphone. Please allow microphone permissions and try again.");
+    }
   };
 
   return (
@@ -268,82 +728,6 @@ const App = () => {
       </header>
 
       <main style={{ maxWidth: '1200px', margin: '2rem auto', padding: '0 2rem' }}>
-        
-        {/* PAGE 0: PROGRESS REPORT */}
-        {activeTab === 'progress' && (
-          <section>
-            <h2 style={{ color: umichBlue, borderBottom: `2px solid ${umichMaize}`, paddingBottom: '0.5rem' }}>Project Progress Report</h2>
-            
-            {/* 1) Data & Overview */}
-            <div style={{ backgroundColor: 'white', padding: '2rem', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', marginBottom: '2rem' }}>
-              <h3 style={{ color: umichBlue, marginTop: 0 }}>1. Data & Overview</h3>
-              <p style={{ lineHeight: '1.6', fontSize: '1.1rem' }}>
-                Our project is a real time Voice Changer and Synthesizer system that processes real human speech data. The speech file is the modulator, and the synthetic broadband signals are the carrier. The main problem with this project is decoupling the voice's raw pitch from its spectral envelope. This is important since it's the filtering of the speech data that forms vowel and consonant sounds. To solve this problem, we are implementing a Phase Vocoder to shift the pitch of the speech data without affecting time, and a Digital Channel Vocoder for extracting and modulating the spectral envelope.
-              </p>
-            </div>
-
-            {/* 2) Three Plots */}
-            <div style={{ backgroundColor: 'white', padding: '2rem', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', marginBottom: '2rem' }}>
-              <h3 style={{ color: umichBlue, marginTop: 0 }}>2. Data Visualizations & Plots</h3>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '2rem', marginTop: '1.5rem' }}>
-                
-                {/* Plot 1 */}
-                <div style={{ border: '1px solid #eee', padding: '1.5rem', borderRadius: '8px' }}>
-                  <h4 style={{ color: umichBlue, marginTop: 0 }}>Plot 1: Raw vs. Pre-Emphasized Speech</h4>
-                  <div style={{ backgroundColor: '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '1rem', border: '1px dashed #cbd5e1' }}>
-                    <img src="/Plot1.jpg" alt="Raw vs. Pre-Emphasized Speech" style={{ maxWidth: '100%', height: 'auto', borderRadius: '4px' }} />
-                  </div>
-                  <p style={{ lineHeight: '1.6' }}><strong>Description:</strong> The first plot shows the raw recorded speech data in the time domain compared to the same signal after passing through a high pass filter. This first filter boosts the higher frequencies from the raw data in order to compensate for the natural tone and volume changes in human voices. This is to ensure the high frequency vowel and consonant sounds remain intelligible during the vocoding process. </p>
-                </div>
-
-                {/* Plot 2*/}
-                <div style={{ border: '1px solid #eee', padding: '1.5rem', borderRadius: '8px' }}>
-                  <h4 style={{ color: umichBlue, marginTop: 0 }}>Plot 2: Spectral Envelope (FFT Spectrogram)</h4>
-                  <div style={{ backgroundColor: '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '1rem', border: '1px dashed #cbd5e1' }}>
-                    <img src="/Plot2.jpg" alt="Spectral Envelope FFT Spectrogram" style={{ maxWidth: '100%', height: 'auto', borderRadius: '4px' }} />
-                  </div>
-                  <p style={{ lineHeight: '1.6' }}><strong>Description:</strong> The second plot is a Fast Fourier Transform (FFT) magnitude spectrum of a single window from the speech data. The point of this plot is to visualize the extracted spectral envelope. This shows the peaks of the signal that characterize the vocal data at a specific moment in time. </p>
-                </div>
-
-                {/* Plot 3*/}
-                <div style={{ border: '1px solid #eee', padding: '1.5rem', borderRadius: '8px' }}>
-                  <h4 style={{ color: umichBlue, marginTop: 0 }}>Plot 3: Modulated Output Waveform</h4>
-                  <div style={{ backgroundColor: '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '1rem', border: '1px dashed #cbd5e1' }}>
-                    <img src="/Plot3.jpg" alt="Modulated Output Waveform" style={{ maxWidth: '100%', height: 'auto', borderRadius: '4px' }} />
-                  </div>
-                  <p style={{ lineHeight: '1.6' }}><strong>Description:</strong> The third plot is the final time domain waveform produced by our algorithm. This plot shows the synthetic carrier signal after it has been modulated across the frequency bands by the speech envelope from plot 2. </p>
-                </div>
-
-              </div>
-            </div>
-
-            {/* 3) Progress and Challenges */}
-            <div style={{ backgroundColor: 'white', padding: '2rem', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', marginBottom: '2rem' }}>
-              <h3 style={{ color: umichBlue, marginTop: 0 }}>3. Current Progress & Challenges</h3>
-              <p style={{ lineHeight: '1.6', fontSize: '1.1rem' }}>
-                To date, we have completed our initial proof-of-concept vocoder in MATLAB, validating both our 16-band logarithmic filter bank and Short-Time Fourier Transform (STFT) spectral envelope extraction algorithms on pre-recorded audio, while simultaneously building our React front-end web application for live microphone routing, offline file uploads, and visual analysis. Our first major challenge was realizing that our MATLAB prototype could not run natively inside a browser without requiring users to have the MATLAB desktop client open or relying on an external backend server. To allow anyone to run the vocoder directly on our website with zero external software, we pivoted to porting our DSP pipeline into client-side JavaScript using the Web Audio API.
-              </p>
-            </div>
-
-            {/* 4) Plan for Next 3 Weeks */}
-            <div style={{ backgroundColor: 'white', padding: '2rem', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', marginBottom: '2rem' }}>
-              <h3 style={{ color: umichBlue, marginTop: 0 }}>4. Three-Week Action Plan</h3>
-              <ul style={{ paddingLeft: '1.5rem', lineHeight: '1.6', fontSize: '1.1rem' }}>
-                <li style={{ marginBottom: '0.5rem' }}><strong>Task 1:</strong> Collect the various human speech and the synthetic carrier data.</li>
-                <li style={{ marginBottom: '0.5rem' }}><strong>Task 2:</strong> Optimize STFT overlap-add buffering for the live Web Audio stream to ensure smooth, low-latency playback.</li>
-                <li style={{ marginBottom: '0.5rem' }}><strong>Task 3:</strong> Finalize UI for the website and connect the live spectrogram visualizations to the Web Audio analyzer.</li>
-              </ul>
-            </div>
-
-            {/* 5) One Thing Learned */}
-            <div style={{ backgroundColor: 'white', padding: '2rem', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
-              <h3 style={{ color: umichBlue, marginTop: 0 }}>5. Key Learning: DSP with JavaScript</h3>
-              <p style={{ lineHeight: '1.6', fontSize: '1.1rem' }}>
-                One new thing we have learned is how DSP works with JavaScript. Prior to our pivot, we had anticipated that we would do our entire project in MATLAB, as the MATLAB signal processing toolbox is very comprehensive and should have had everything that we needed for the project. However, upon realizing we would have to pivot away from MATLAB, we shifted our focus to a JavaScript based approach. Through this transition, we learned how the browser's built in Web Audio API handles real-time digital signal processing by routing audio through modular processing nodes on a dedicated audio rendering thread separate from the main user interface. Specifically, we discovered that JavaScript uses floating-point arrays to pass raw audio buffers between nodes, allowing us to implement custom bandpass filters for our offline filter bank and perform low-latency buffering for our live STFT vocoder directly in the browser without limiting page responsiveness.
-              </p>
-            </div>
-          </section>
-        )}
 
         {/* PAGE 1: OVERVIEW */}
         {activeTab === 'overview' && (
@@ -364,15 +748,15 @@ const App = () => {
               </p>
               <ul style={{ paddingLeft: '1.5rem', lineHeight: '1.6', fontSize: '1.1rem' }}>
                 <li><strong>Time-Domain Analog Emulation:</strong> A 24-channel cascaded filter bank that relies on classical bandpass filtering and time-domain amplitude modulation, designed for offline processing of pre-recorded audio files.</li>
-                <li><strong>Frequency-Domain Live Processing:</strong> A highly optimized, low-latency overlap-add architecture utilizing the Short-Time Fourier Transform (STFT) to vocode live microphone input in real-time.</li>
+                <li><strong>Live Real-Time Processing:</strong> A low-latency Web Audio API streaming vocoder with real-time carrier synthesis, formant shifting, noise gating, and a scrolling spectrogram display.</li>
               </ul>
             </div>
 
             <div style={{ backgroundColor: 'white', padding: '2rem', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
               <h3 style={{ color: umichBlue, marginTop: 0 }}>How to Use This Application</h3>
               <ul style={{ paddingLeft: '1.5rem', lineHeight: '1.6', fontSize: '1.1rem' }}>
-                <li><strong>Live Vocoder:</strong> Navigate to the Live tab. Select a carrier signal from the dropdown. Click "Start," allow microphone permissions, and speak. The system will buffer your audio, compute the STFT to extract your spectral envelope, and dynamically modulate the carrier in real-time.</li>
-                <li><strong>Offline Vocoder:</strong> Navigate to the Offline tab. Upload a speech file (the modulator) and an instrumental track (the carrier). The system will process the files through our IIR filter bank, providing high-fidelity vocoded output alongside spectrum analysis visualizations.</li>
+                <li><strong>Live Vocoder:</strong> Navigate to the Live tab. Select a carrier signal or voice effect from the dropdown, click "Start Live Input," allow microphone permissions, and speak (headphones recommended to prevent feedback).</li>
+                <li><strong>Offline Vocoder:</strong> Navigate to the Offline tab. Upload a speech file (the modulator) and an instrumental track (the carrier). The system will process the files through our 24-band IIR filter bank and generate an interactive spectrogram synced to playback.</li>
               </ul>
             </div>
           </section>
@@ -382,7 +766,7 @@ const App = () => {
         {activeTab === 'methods' && (
           <section>
             <h2 style={{ color: umichBlue, borderBottom: `2px solid ${umichMaize}`, paddingBottom: '0.5rem' }}>DSP Methods & Architecture</h2>
-            
+
             <div style={{ backgroundColor: '#f1f5f9', padding: '1.5rem', borderRadius: '8px', marginBottom: '2rem' }}>
               <h3 style={{ marginTop: 0, color: umichBlue }}>List of DSP Concepts Applied</h3>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
@@ -417,30 +801,25 @@ const App = () => {
                 <h4 style={{ color: umichBlue }}>2. Bandpass Filtering</h4>
                 <p>The signals are split into 24 distinct frequency bands using 4th-order cascaded Butterworth bandpass filters. These bands are spaced logarithmically to mimic the non-linear sensitivity of human hearing, focusing more resolution on the lower frequencies where speech energy is concentrated.</p>
                 <div style={{ margin: '1.5rem 0', textAlign: 'center' }}>
-                  <img src="/BandFrequencies.jpg" alt="Logarithmically Spaced Filter Bank" style={{ maxWidth: '100%', height: 'auto', borderRadius: '4px', boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }} />
+                  <img src={`${process.env.PUBLIC_URL}/BandFrequencies.jpg`} alt="Logarithmically Spaced Filter Bank" style={{ maxWidth: '100%', height: 'auto', borderRadius: '4px', boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }} />
                 </div>
                 <h4 style={{ color: umichBlue }}>3. Envelope Extraction & Modulation</h4>
                 <p>For each band, we extract the "shape" of the speech signal. The signal is first rectified (absolute value), passed through cascaded low-pass filters to capture the amplitude contour, and finally expanded quadratically to suppress background noise.</p>
                 <p>Finally, the envelope of each speech band is multiplied by the carrier signal in that exact same frequency band. All modulated bands are then summed together (additive synthesis) to produce the final vocoded track.</p>
                 <div style={{ margin: '1.5rem 0', textAlign: 'center' }}>
-                  <img src="/SpeechEnvelope.jpg" alt="Speech Envelope Extraction" style={{ maxWidth: '100%', height: 'auto', borderRadius: '4px', boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }} />
+                  <img src={`${process.env.PUBLIC_URL}/SpeechEnvelope.jpg`} alt="Speech Envelope Extraction" style={{ maxWidth: '100%', height: 'auto', borderRadius: '4px', boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }} />
                 </div>
               </div>
 
               <div style={{ backgroundColor: 'white', padding: '2rem', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
-                <h3 style={{ color: umichBlue, marginTop: 0, fontSize: '1.4rem' }}>Digital (Live) STFT Design</h3>
-                <p>Because running massive cascaded filter banks is computationally expensive and introduces phase delays, our live real-time vocoder uses frequency-domain multiplication via the Short-Time Fourier Transform (STFT).</p>
-                <h4 style={{ color: umichBlue }}>1. Windowing and Buffering</h4>
-                <p>The continuous live microphone signal is segmented into buffers of 1024 samples. To prevent spectral leakage and edge artifacts, each frame is multiplied by a Hann window before processing.</p>
-                <h4 style={{ color: umichBlue }}>2. Spectral Envelope Extraction & Modulation</h4>
-                <p>We compute the Fast Fourier Transform (FFT) of the windowed speech frame. By taking the magnitude spectrum of this FFT and smoothing it (e.g., via a Gaussian filter or moving average), we approximate the spectral envelope of the user's voice for that exact moment in time.</p>
-                <p>The carrier signal (also windowed and transformed via FFT) is then multiplied by this speech envelope in the frequency domain. This efficiently maps the vocal resonances onto the synthesizer tone.</p>
-                <h4 style={{ color: umichBlue }}>3. Overlap-Add Reconstruction</h4>
-                <p>To convert back to audio, we compute the Inverse Fast Fourier Transform (IFFT). Because we use windowed frames, we must overlap the output buffers (typically by 50%, or 512 samples) and add them together to reconstruct a continuous, artifact-free output signal.</p>
-                <div style={{ height: '250px', backgroundColor: '#e2e8f0', borderRadius: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '1.5rem 0', flexDirection: 'column' }}>
-                  <Activity size={32} color="#94a3b8" />
-                  <span style={{ color: '#64748b', marginTop: '0.5rem' }}>[ Live STFT Spectrogram Output will render here ]</span>
-                </div>
+                <h3 style={{ color: umichBlue, marginTop: 0, fontSize: '1.4rem' }}>Digital (Live) Real-Time Design</h3>
+                <p>Our live real-time vocoder processes streaming microphone audio directly on the browser's dedicated Web Audio rendering thread, pairing a 20-band real-time filter bank with per-band noise gating and FFT-based spectrogram analysis.</p>
+                <h4 style={{ color: umichBlue }}>1. Real-Time Carrier Synthesis & Formant Shifting</h4>
+                <p>Broadband carrier waveforms (Sawtooth Synth, Synth Chord, Chipmunk, Deep Monster, White Noise, or Robot Drone) are synthesized natively in real time. For Chipmunk and Monster effects, the synthesis filter bank center frequencies are scaled relative to the analysis filter bank to shift vocal formants.</p>
+                <h4 style={{ color: umichBlue }}>2. Live Envelope Tracking & Noise Gating</h4>
+                <p>Incoming microphone audio is pre-emphasized, split into 20 logarithmic bands, rectified, smoothed with 35 Hz low-pass filters, and passed through a thresholded quadratic noise gate to keep the carrier silent between words.</p>
+                <h4 style={{ color: umichBlue }}>3. Real-Time STFT Visualization</h4>
+                <p>The summed vocoded output is tapped by a 1024-point Web Audio <code>AnalyserNode</code>, computing windowed FFT magnitude frames at 60 FPS to render a live scrolling spectrogram.</p>
               </div>
             </div>
           </section>
@@ -451,25 +830,80 @@ const App = () => {
           <section>
             <h2 style={{ color: umichBlue, borderBottom: `2px solid ${umichMaize}`, paddingBottom: '0.5rem' }}>Live Real-Time Vocoder</h2>
             <div style={{ backgroundColor: 'white', padding: '2rem', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', textAlign: 'center' }}>
-              <p style={{ marginBottom: '2rem', fontSize: '1.1rem' }}>Select a carrier signal, click Start, and speak into your microphone.</p>
-              <div style={{ display: 'flex', justifyContent: 'center', gap: '1rem', marginBottom: '2rem' }}>
-                <select style={{ padding: '0.75rem', fontSize: '1rem', borderRadius: '4px', border: '1px solid #ccc', minWidth: '250px' }}>
-                  <option>Select Carrier Signal...</option>
-                  <option>Sawtooth Synth</option>
-                  <option>White Noise</option>
-                  <option>Robot Drone</option>
+              <p style={{ marginBottom: '1.5rem', fontSize: '1.1rem' }}>
+                Select a carrier signal, click <strong>Start Live Input</strong>, and speak into your microphone. <em>(Use headphones to prevent feedback.)</em>
+              </p>
+              <div style={{ display: 'flex', justifyContent: 'center', gap: '1rem', marginBottom: '2rem', flexWrap: 'wrap' }}>
+                <select
+                  value={liveCarrierType}
+                  onChange={(e) => setLiveCarrierType(e.target.value)}
+                  disabled={isLiveRunning}
+                  style={{ padding: '0.75rem', fontSize: '1rem', borderRadius: '4px', border: '1px solid #ccc', minWidth: '280px' }}
+                >
+                  <option value="sawtooth">Sawtooth Synth (A2 + E3)</option>
+                  <option value="chord">Daft Synth Chord (A Major)</option>
+                  <option value="chipmunk">Chipmunk Voice (Formant Shift Up)</option>
+                  <option value="monster">Deep Monster (Formant Shift Down)</option>
+                  <option value="noise">White Noise (Whisper)</option>
+                  <option value="robot">Robot Drone (Square + Detuned Saw)</option>
                 </select>
-                <button style={{ backgroundColor: '#28a745', color: 'white', border: 'none', padding: '0.75rem 1.5rem', fontSize: '1rem', borderRadius: '4px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <Mic size={18} /> Start Live Input
+                <button
+                  onClick={startLiveVocoder}
+                  disabled={isLiveRunning}
+                  style={{ backgroundColor: isLiveRunning ? '#94a3b8' : '#28a745', color: 'white', border: 'none', padding: '0.75rem 1.5rem', fontSize: '1rem', borderRadius: '4px', cursor: isLiveRunning ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 'bold' }}
+                >
+                  <Mic size={18} /> {isLiveRunning ? 'Live Active...' : 'Start Live Input'}
                 </button>
-                <button style={{ backgroundColor: '#dc3545', color: 'white', border: 'none', padding: '0.75rem 1.5rem', fontSize: '1rem', borderRadius: '4px', cursor: 'pointer' }}>
+                <button
+                  onClick={stopLiveVocoder}
+                  disabled={!isLiveRunning}
+                  style={{ backgroundColor: !isLiveRunning ? '#94a3b8' : '#dc3545', color: 'white', border: 'none', padding: '0.75rem 1.5rem', fontSize: '1rem', borderRadius: '4px', cursor: !isLiveRunning ? 'not-allowed' : 'pointer', fontWeight: 'bold' }}
+                >
                   Stop
                 </button>
               </div>
-              
-              <div style={{ height: '300px', backgroundColor: '#222', borderRadius: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column' }}>
-                <Activity size={48} color="#00ff00" />
-                <p style={{ color: '#00ff00', marginTop: '1rem', fontFamily: 'monospace' }}>Awaiting Audio Stream...</p>
+
+              <div style={{ position: 'relative', height: '300px', backgroundColor: '#111', borderRadius: '6px', overflow: 'hidden', border: `2px solid ${umichBlue}` }}>
+                <canvas
+                  ref={liveCanvasRef}
+                  width={900}
+                  height={300}
+                  style={{ width: '100%', height: '100%', display: 'block' }}
+                />
+
+                {/* Stationary Y-Axis Frequency Labels */}
+                <div style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  bottom: 0,
+                  width: '54px',
+                  backgroundColor: 'rgba(0, 0, 0, 0.55)',
+                  borderRight: '1px solid rgba(255, 255, 255, 0.2)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  justifyContent: 'space-between',
+                  padding: '6px 6px',
+                  color: '#fff',
+                  fontSize: '11px',
+                  fontFamily: 'monospace',
+                  textAlign: 'right',
+                  pointerEvents: 'none',
+                  boxSizing: 'border-box'
+                }}>
+                  <span>8 kHz</span>
+                  <span>6 kHz</span>
+                  <span>4 kHz</span>
+                  <span>2 kHz</span>
+                  <span>0 Hz</span>
+                </div>
+
+                {!isLiveRunning && (
+                  <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', pointerEvents: 'none' }}>
+                    <Activity size={48} color={umichMaize} />
+                    <p style={{ color: umichMaize, marginTop: '1rem', fontFamily: 'monospace' }}>Awaiting Live Audio Stream...</p>
+                  </div>
+                )}
               </div>
             </div>
           </section>
@@ -480,7 +914,7 @@ const App = () => {
           <section>
             <h2 style={{ color: umichBlue, borderBottom: `2px solid ${umichMaize}`, paddingBottom: '0.5rem' }}>Offline File Processing</h2>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem', marginTop: '1.5rem' }}>
-              
+
               <div style={{ backgroundColor: 'white', padding: '1.5rem', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
                 <h3 style={{ marginTop: 0, color: umichBlue }}>Audio Inputs</h3>
                 <div style={{ marginBottom: '1.5rem' }}>
@@ -491,7 +925,7 @@ const App = () => {
                   <label style={{ display: 'block', fontWeight: 'bold', marginBottom: '0.5rem' }}>2. Carrier (Synth/Music) File</label>
                   <input type="file" accept="audio/*" onChange={(e) => setCarrierFile(e.target.files[0])} style={{ width: '100%', padding: '0.5rem', border: '1px solid #ddd', borderRadius: '4px' }} />
                 </div>
-                <button 
+                <button
                   onClick={processOfflineVocoder}
                   disabled={isProcessing}
                   style={{ backgroundColor: isProcessing ? '#999' : umichBlue, color: isProcessing ? '#fff' : umichMaize, border: 'none', padding: '1rem 1.5rem', fontSize: '1.1rem', width: '100%', borderRadius: '4px', cursor: isProcessing ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', fontWeight: 'bold' }}
@@ -500,18 +934,47 @@ const App = () => {
                 </button>
               </div>
 
-              <div style={{ backgroundColor: 'white', padding: '1.5rem', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
-                <h3 style={{ margin: '0 0 1rem 0', color: umichBlue }}>Output & Analysis</h3>
-                <div style={{ height: '200px', backgroundColor: '#f8f9fa', borderRadius: '4px', border: '1px solid #ddd', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '1rem', flexDirection: 'column' }}>
-                  {offlineOutputUrl ? (
-                    <Activity size={48} color={umichBlue} />
-                  ) : (
-                    <p style={{ color: '#666' }}>Upload files and click Process to generate analysis.</p>
-                  )}
+              <div style={{ backgroundColor: 'white', padding: '1.5rem', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+                <div>
+                  <h3 style={{ margin: '0 0 1rem 0', color: umichBlue }}>Vocoded Audio Output</h3>
+                  <p style={{ color: '#555', lineHeight: '1.5', marginBottom: '1.5rem' }}>
+                    Once processed, press play below to hear the vocoded output and watch the synchronized playhead track across the spectrogram.
+                  </p>
                 </div>
-                <audio controls src={offlineOutputUrl} style={{ width: '100%' }}>
+                <audio
+                  ref={offlineAudioRef}
+                  controls
+                  src={offlineOutputUrl}
+                  onPlay={startOfflinePlayheadLoop}
+                  onPause={stopOfflinePlayheadLoop}
+                  onEnded={stopOfflinePlayheadLoop}
+                  onSeeked={drawOfflineFrame}
+                  style={{ width: '100%' }}
+                >
                   Your browser does not support the audio element.
                 </audio>
+              </div>
+            </div>
+
+            {/* FULL-WIDTH OFFLINE SPECTROGRAM PANEL */}
+            <div style={{ backgroundColor: 'white', padding: '1.5rem', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', marginTop: '2rem' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                <h3 style={{ margin: 0, color: umichBlue }}>Vocoded Output Spectrogram (0 – 8 kHz)</h3>
+                {hasSpectrogram && <span style={{ fontSize: '0.9rem', color: '#666' }}>Yellow bar tracks live playback position</span>}
+              </div>
+              <div style={{ position: 'relative', height: '260px', backgroundColor: '#111', borderRadius: '6px', overflow: 'hidden', border: '1px solid #ddd' }}>
+                <canvas
+                  ref={offlineCanvasRef}
+                  width={1000}
+                  height={260}
+                  style={{ width: '100%', height: '100%', display: 'block' }}
+                />
+                {!hasSpectrogram && (
+                  <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', backgroundColor: '#f8f9fa' }}>
+                    <Activity size={40} color="#94a3b8" />
+                    <p style={{ color: '#64748b', marginTop: '0.5rem' }}>Upload files and click Process to generate the vocoded spectrogram.</p>
+                  </div>
+                )}
               </div>
             </div>
           </section>
@@ -522,7 +985,7 @@ const App = () => {
           <section>
             <h2 style={{ color: umichBlue, borderBottom: `2px solid ${umichMaize}`, paddingBottom: '0.5rem' }}>Team Contributions & References</h2>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', marginTop: '1.5rem' }}>
-              
+
               <div style={{ backgroundColor: 'white', padding: '1.5rem', borderRadius: '8px', borderLeft: `5px solid ${umichBlue}` }}>
                 <h3 style={{ margin: '0 0 0.5rem 0', color: umichBlue }}>Michael Wu (mikewoo)</h3>
                 <p style={{ margin: 0 }}>Led the DSP filter bank implementation, algorithm latency benchmarking, and formulated the real-time buffer processing architecture.</p>
@@ -544,7 +1007,7 @@ const App = () => {
               <ol style={{ paddingLeft: '1.5rem', margin: 0, lineHeight: '1.6' }}>
                 <li>Smith, J.O. "Short-Time Fourier Transform." <em>Spectral Audio Signal Processing</em>, W3K Publishing.</li>
                 <li>Bell Laboratories Record. "The Vocoder." 1939. Background on transmission bandwidth preservation and SIGSALY.</li>
-                <li>MDN Web Docs. <em>Web Audio API</em>. Mozilla Foundation. <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Audio_API" target="_blank" rel="noreferrer" style={{color: umichBlue}}>https://developer.mozilla.org/en-US/docs/Web/API/Web_Audio_API</a></li>
+                <li>MDN Web Docs. <em>Web Audio API</em>. Mozilla Foundation. <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Audio_API" target="_blank" rel="noreferrer" style={{ color: umichBlue }}>https://developer.mozilla.org/en-US/docs/Web/API/Web_Audio_API</a></li>
               </ol>
             </div>
           </section>
